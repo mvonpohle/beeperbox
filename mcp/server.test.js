@@ -412,10 +412,10 @@ test('serverInfo version is single-sourced from package.json (no drift)', () => 
   assert.equal(S.VERSION, pkg.version);
 });
 
-test('the tool registry is exactly the 12 documented verbs', () => {
+test('the tool registry is exactly the 13 documented verbs', () => {
   const expected = [
     'list_accounts', 'list_inbox', 'list_unread', 'get_chat', 'read_chat',
-    'search_messages', 'send_message', 'note_to_self', 'react_to_message',
+    'search_messages', 'send_message', 'send_media', 'note_to_self', 'react_to_message',
     'archive_chat', 'poll_messages', 'download_asset',
   ].sort();
   assert.deepEqual([...S.TOOL_NAMES].sort(), expected);
@@ -572,4 +572,67 @@ test('normalizeAccount surfaces the backend connection status (observability)', 
   assert.equal(out.status, 'connecting', 'status must be relayed so connecting != connected is visible');
   assert.equal(out.network, 'telegram');
   assert.equal(out.account_id, 'telegram');
+});
+
+// ── send_media: prepareMediaUpload + captionless echo-guard ─────
+test('prepareMediaUpload: validates input presence and mutual exclusion', () => {
+  assert.throws(() => S.prepareMediaUpload({}), /requires file_path or data_base64/);
+  assert.throws(
+    () => S.prepareMediaUpload({ file_path: '/tmp/a.png', data_base64: 'AQID' }),
+    /not both/,
+  );
+});
+
+test('prepareMediaUpload: decodes raw base64 and data URI, strips mime_type, enforces cap', () => {
+  const raw = S.prepareMediaUpload({ data_base64: 'AQID', file_name: 'dot.bin' }, 100);
+  assert.equal(raw.content, 'AQID');
+  assert.equal(raw.bytes, 3);
+  assert.equal(raw.fileName, 'dot.bin');
+  assert.equal(raw.mimeType, null);
+
+  const uri = S.prepareMediaUpload({ data_base64: 'data:image/png;base64,AQID' }, 100);
+  assert.equal(uri.content, 'AQID');
+  assert.equal(uri.bytes, 3);
+  assert.equal(uri.mimeType, 'image/png');
+
+  assert.throws(() => S.prepareMediaUpload({ data_base64: 'not*base64!' }, 100), /not valid base64/);
+  assert.throws(() => S.prepareMediaUpload({ data_base64: 'AQID' }, 2), /over the 2-byte cap/);
+});
+
+test('prepareMediaUpload: reads file_path, derives fileName, enforces cap', () => {
+  const file = path.join(os.tmpdir(), `bb-media-test-${process.pid}.png`);
+  fs.writeFileSync(file, Buffer.from([1, 2, 3, 4]));
+  try {
+    const res = S.prepareMediaUpload({ file_path: file }, 100);
+    assert.equal(res.content, 'AQIDBA==');
+    assert.equal(res.bytes, 4);
+    assert.equal(res.fileName, path.basename(file));
+    assert.throws(() => S.prepareMediaUpload({ file_path: file }, 2), /over the 2-byte cap/);
+    assert.throws(() => S.prepareMediaUpload({ file_path: `${file}.missing` }, 100), /cannot read file_path/);
+  } finally {
+    try { fs.unlinkSync(file); } catch { /* ignore */ }
+  }
+});
+
+test('captionless send does not false-match unrelated captionless human messages via textHash', () => {
+  const file = path.join(os.tmpdir(), `bb-captionless-test-${process.pid}.json`);
+  process.env.BEEPERBOX_SENT_LEDGER = file;
+  try {
+    S._resetLedger();
+    S.recordSent({ chat_id: 'c1', sent_id: 'pending-media-1', text: '', client_tag: 'media-1' });
+    const entries = S.loadLedger();
+    assert.equal(entries[0].text_hash, null);
+
+    // Human sends another captionless image in the same chat: must stay external.
+    const human = S.matchSentMessage({ id: 'human-media-2', chat_id: 'c1', text: '', is_self: true }, entries, Date.now());
+    assert.deepEqual(human, { source: 'external', client_tag: null });
+
+    // Our own sent ID still matches as api.
+    const ours = S.matchSentMessage({ id: 'pending-media-1', chat_id: 'c1', text: '', is_self: true }, entries, Date.now());
+    assert.deepEqual(ours, { source: 'api', client_tag: 'media-1' });
+  } finally {
+    try { fs.unlinkSync(file); } catch { /* ignore */ }
+    delete process.env.BEEPERBOX_SENT_LEDGER;
+    S._resetLedger();
+  }
 });

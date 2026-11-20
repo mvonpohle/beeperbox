@@ -630,7 +630,7 @@ function recordSent({ chat_id, sent_id, text, client_tag }) {
     // when we have the authoritative final id (retires the text fallback).
     sent_ids: sent_id ? [String(sent_id)] : [],
     resolved: false,
-    text_hash: textHash(text),
+    text_hash: String(text || '').trim() ? textHash(text) : null,
     client_tag: client_tag ? String(client_tag).slice(0, CLIENT_TAG_MAX) : null,
     ts: Date.now(),
   };
@@ -704,7 +704,7 @@ function matchSentMessage(msg, entries, now) {
     for (const e of entries) {
       if (e.chat_id !== msg.chat_id) continue;
       if (e.resolved === true) continue;
-      if (e.text_hash === h && (now - e.ts) <= LEDGER_TEXT_WINDOW_MS) {
+      if (e.text_hash != null && e.text_hash === h && (now - e.ts) <= LEDGER_TEXT_WINDOW_MS) {
         return { source: 'api', client_tag: e.client_tag || null };
       }
     }
@@ -723,6 +723,79 @@ function applyEchoTags(messages, now) {
     );
     return { ...m, source: meta.source, client_tag: meta.client_tag };
   });
+}
+
+// ─── media upload helper ──────────────────────────────────────────
+
+// Normalize either a local `file_path` or a `data_base64` string (optionally
+// wrapped in a `data:<mime>;base64,...` URI) into the JSON payload expected by
+// Beeper's `POST /v1/assets/upload/base64`. Enforces MAX_ASSET_BYTES before
+// sending so oversized payloads fail fast with -32005.
+function prepareMediaUpload(args = {}, maxBytes = MAX_ASSET_BYTES) {
+  const hasPath = typeof args.file_path === 'string' && args.file_path.trim().length > 0;
+  const hasB64 = typeof args.data_base64 === 'string' && args.data_base64.trim().length > 0;
+  if (!hasPath && !hasB64) {
+    throw rpcError(-32602, 'send_media requires file_path or data_base64');
+  }
+  if (hasPath && hasB64) {
+    throw rpcError(-32602, 'send_media accepts either file_path or data_base64, not both');
+  }
+
+  let content = '';
+  let bytes = 0;
+  let fileName = args.file_name ? String(args.file_name) : '';
+  let mimeType = args.mime_type ? String(args.mime_type) : '';
+
+  if (hasPath) {
+    const fs = require('fs');
+    const filePath = String(args.file_path);
+    let stat;
+    try {
+      stat = fs.statSync(filePath);
+    } catch (e) {
+      throw rpcError(-32602, `cannot read file_path "${filePath}": ${e.code || e.message}`);
+    }
+    if (!stat.isFile()) {
+      throw rpcError(-32602, `file_path "${filePath}" is not a regular file`);
+    }
+    if (maxBytes && stat.size > maxBytes) {
+      throw rpcError(-32005, `asset is ${stat.size} bytes, over the ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+    }
+    const buf = fs.readFileSync(filePath);
+    if (maxBytes && buf.length > maxBytes) {
+      throw rpcError(-32005, `asset is ${buf.length} bytes, over the ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+    }
+    content = buf.toString('base64');
+    bytes = buf.length;
+    if (!fileName) fileName = path.basename(filePath);
+  } else {
+    let raw = String(args.data_base64).trim();
+    const m = /^data:([^;,\s]+);base64,([\s\S]+)$/i.exec(raw);
+    if (m) {
+      if (!mimeType) mimeType = m[1];
+      raw = m[2];
+    }
+    const cleaned = raw.replace(/\s+/g, '');
+    if (!cleaned || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned) || cleaned.length % 4 !== 0) {
+      throw rpcError(-32602, 'data_base64 is not valid base64');
+    }
+    const buf = Buffer.from(cleaned, 'base64');
+    if (buf.length === 0) {
+      throw rpcError(-32602, 'data_base64 decoded to 0 bytes');
+    }
+    if (maxBytes && buf.length > maxBytes) {
+      throw rpcError(-32005, `asset is ${buf.length} bytes, over the ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+    }
+    content = cleaned;
+    bytes = buf.length;
+  }
+
+  return {
+    content,
+    bytes,
+    fileName: fileName || null,
+    mimeType: mimeType || null,
+  };
 }
 
 // ─── tool registry ────────────────────────────────────────────────
@@ -824,6 +897,26 @@ const TOOLS = [
         client_tag: { type: 'string', description: 'Optional idempotency/echo tag. Recorded against this send and echoed back on the message as `client_tag` when it reappears in poll_messages / read_chat (where it is also marked source:"api"), so an agent can recognize and skip its own programmatic sends.' },
       },
       required: ['chat_id', 'text'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'send_media',
+    description: 'Send an image, video, audio, or file attachment to a chat, with an optional text caption. Provide either `file_path` (a local file readable by the MCP server, avoiding HTTP body-size limits) or `data_base64` (base64-encoded bytes or data URI). Uploads the asset via Beeper\'s `/v1/assets/upload/base64` endpoint and sends it to the chat.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'The chat ID to send to (the `id` field from any Chat object).' },
+        file_path: { type: 'string', description: 'Path to a local file readable by the MCP server. Provide either file_path or data_base64.' },
+        data_base64: { type: 'string', description: 'Base64-encoded file bytes (raw base64 or data:...;base64,... URI). Provide either file_path or data_base64.', minLength: 1 },
+        file_name: { type: 'string', description: 'Optional original file name. Derived from file_path if omitted.' },
+        mime_type: { type: 'string', description: 'Optional MIME type (e.g. "image/png"). Auto-detected by Beeper if omitted.' },
+        type: { type: 'string', enum: ['image', 'video', 'audio', 'file', 'gif', 'voice-note', 'sticker'], description: 'Optional attachment type hint. Auto-detected from MIME type if omitted.' },
+        text: { type: 'string', description: 'Optional caption or message text to send with the attachment.' },
+        reply_to_message_id: { type: 'string', description: 'Optional. Pass a message_id to send this as a reply to that specific message.' },
+        client_tag: { type: 'string', description: 'Optional idempotency/echo tag. Recorded against this send and echoed back on the message as `client_tag` when it reappears in poll_messages / read_chat (where it is also marked source:"api").' },
+      },
+      required: ['chat_id'],
       additionalProperties: false,
     },
   },
@@ -1016,6 +1109,51 @@ async function callTool(name, args) {
         message_id: finalID || pendingID,
         pending_message_id: pendingID,
         resolved: !!finalID,
+        client_tag: args.client_tag || null,
+        status: 'sent',
+      };
+    }
+
+    case 'send_media': {
+      if (!args.chat_id) throw rpcError(-32602, 'send_media requires chat_id');
+      const media = prepareMediaUpload(args);
+      const uploadBody = { content: media.content };
+      if (media.fileName) uploadBody.fileName = media.fileName;
+      if (media.mimeType) uploadBody.mimeType = media.mimeType;
+
+      const upload = await beeperFetch('/v1/assets/upload/base64', {
+        method: 'POST',
+        body: uploadBody,
+        timeoutMs: ASSET_TIMEOUT_MS,
+      });
+      if (!upload || !upload.uploadID) {
+        throw rpcError(-32001, 'beeper asset upload did not return an uploadID');
+      }
+
+      const attachment = { uploadID: upload.uploadID };
+      if (args.type) attachment.type = args.type;
+      const body = { attachment };
+      if (args.text) body.text = args.text;
+      if (args.reply_to_message_id) body.replyToMessageID = args.reply_to_message_id;
+
+      const sent = await beeperFetch(
+        `/v1/chats/${encodeURIComponent(args.chat_id)}/messages`,
+        { method: 'POST', body },
+      );
+      const chatID = sent?.chatID || args.chat_id;
+      const pendingID = String(sent?.pendingMessageID || '');
+      const entry = recordSent({ chat_id: chatID, sent_id: pendingID, text: args.text || '', client_tag: args.client_tag });
+      const finalID = await resolveSentId(chatID, pendingID);
+      if (finalID) addResolvedId(entry, finalID);
+      return {
+        chat_id: chatID,
+        message_id: finalID || pendingID,
+        pending_message_id: pendingID,
+        resolved: !!finalID,
+        upload_id: upload.uploadID,
+        file_name: upload.fileName || media.fileName || null,
+        mime_type: upload.mimeType || media.mimeType || null,
+        bytes: media.bytes,
         client_tag: args.client_tag || null,
         status: 'sent',
       };
@@ -1366,6 +1504,7 @@ module.exports = {
   normalizeAttachments,
   normalizeAccount,
   assertServableSrcUrl,
+  prepareMediaUpload,
   matchSentMessage,
   recordSent,
   addResolvedId,
