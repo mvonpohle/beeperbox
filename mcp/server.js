@@ -752,7 +752,7 @@ function readBoundedFile(filePath, maxBytes) {
     realRoot = fs.realpathSync(uploadRoot);
     realPath = fs.realpathSync(filePath);
     const rootPrefix = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
-    if (!realPath.startsWith(rootPrefix)) {
+    if (realPath !== realRoot && !realPath.startsWith(rootPrefix)) {
       throw new Error('outside root');
     }
     stat = fs.statSync(realPath);
