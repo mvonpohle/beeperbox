@@ -727,11 +727,92 @@ function applyEchoTags(messages, now) {
 
 // ─── media upload helper ──────────────────────────────────────────
 
-// Normalize either a local `file_path` or a `data_base64` string (optionally
+const ALLOWED_ATTACHMENT_TYPES = new Set([
+  'image', 'video', 'audio', 'file', 'gif', 'voice-note', 'sticker',
+]);
+const MIME_TYPE_RE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i;
+
+function sanitizeFileName(name) {
+  if (name == null) return '';
+  if (typeof name !== 'string') throw rpcError(-32602, 'file_name must be a string');
+  const base = path.basename(name).replace(/[\x00-\x1f\x7f/\\]/g, '').trim().slice(0, 255);
+  return (base === '.' || base === '..') ? '' : base;
+}
+
+function readBoundedFile(filePath, maxBytes) {
+  const fs = require('fs');
+  const uploadRoot = process.env.BEEPERBOX_UPLOAD_ROOT || '';
+  if (!uploadRoot) {
+    throw rpcError(-32602, 'file_path is disabled unless BEEPERBOX_UPLOAD_ROOT is set');
+  }
+  let realRoot;
+  let realPath;
+  let stat;
+  try {
+    realRoot = fs.realpathSync(uploadRoot);
+    realPath = fs.realpathSync(filePath);
+    const rootPrefix = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+    if (!realPath.startsWith(rootPrefix)) {
+      throw new Error('outside root');
+    }
+    stat = fs.statSync(realPath);
+  } catch {
+    throw rpcError(-32602, 'file_path is not readable or outside BEEPERBOX_UPLOAD_ROOT');
+  }
+  if (!stat.isFile()) {
+    throw rpcError(-32602, 'file_path is not a regular file');
+  }
+  if (maxBytes && stat.size > maxBytes) {
+    throw rpcError(-32005, `asset is ${stat.size} bytes, over the ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+  }
+
+  const limit = maxBytes ? maxBytes + 1 : 0;
+  let fd;
+  const chunks = [];
+  let total = 0;
+  try {
+    fd = fs.openSync(realPath, 'r');
+    const chunkSize = 65536;
+    while (true) {
+      const toRead = limit ? Math.min(chunkSize, limit - total) : chunkSize;
+      if (toRead <= 0) break;
+      const chunk = Buffer.allocUnsafe(toRead);
+      const n = fs.readSync(fd, chunk, 0, toRead, null);
+      if (n === 0) break;
+      chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
+      total += n;
+    }
+  } catch {
+    throw rpcError(-32602, 'file_path is not readable or outside BEEPERBOX_UPLOAD_ROOT');
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+
+  if (total === 0) {
+    throw rpcError(-32602, 'file_path is empty (0 bytes)');
+  }
+  if (maxBytes && total > maxBytes) {
+    throw rpcError(-32005, `asset exceeds ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+  }
+  return { buf: Buffer.concat(chunks, total), realPath };
+}
+
+// Normalize either a confined `file_path` or a `data_base64` string (optionally
 // wrapped in a `data:<mime>;base64,...` URI) into the JSON payload expected by
 // Beeper's `POST /v1/assets/upload/base64`. Enforces MAX_ASSET_BYTES before
-// sending so oversized payloads fail fast with -32005.
+// allocating large buffers so oversized payloads fail fast with -32005.
 function prepareMediaUpload(args = {}, maxBytes = MAX_ASSET_BYTES) {
+  if (args.file_path !== undefined && typeof args.file_path !== 'string') {
+    throw rpcError(-32602, 'file_path must be a string');
+  }
+  if (args.data_base64 !== undefined && typeof args.data_base64 !== 'string') {
+    throw rpcError(-32602, 'data_base64 must be a string');
+  }
+  if (args.mime_type !== undefined && typeof args.mime_type !== 'string') {
+    throw rpcError(-32602, 'mime_type must be a string');
+  }
   const hasPath = typeof args.file_path === 'string' && args.file_path.trim().length > 0;
   const hasB64 = typeof args.data_base64 === 'string' && args.data_base64.trim().length > 0;
   if (!hasPath && !hasB64) {
@@ -743,39 +824,25 @@ function prepareMediaUpload(args = {}, maxBytes = MAX_ASSET_BYTES) {
 
   let content = '';
   let bytes = 0;
-  let fileName = args.file_name ? String(args.file_name) : '';
-  let mimeType = args.mime_type ? String(args.mime_type) : '';
+  let fileName = sanitizeFileName(args.file_name);
+  let mimeType = args.mime_type ? args.mime_type.trim() : '';
 
   if (hasPath) {
-    const fs = require('fs');
-    const filePath = String(args.file_path);
-    let stat;
-    try {
-      stat = fs.statSync(filePath);
-    } catch (e) {
-      throw rpcError(-32602, `cannot read file_path "${filePath}": ${e.code || e.message}`);
-    }
-    if (!stat.isFile()) {
-      throw rpcError(-32602, `file_path "${filePath}" is not a regular file`);
-    }
-    if (maxBytes && stat.size > maxBytes) {
-      throw rpcError(-32005, `asset is ${stat.size} bytes, over the ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
-    }
-    const buf = fs.readFileSync(filePath);
-    if (maxBytes && buf.length > maxBytes) {
-      throw rpcError(-32005, `asset is ${buf.length} bytes, over the ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
-    }
+    const { buf, realPath } = readBoundedFile(args.file_path.trim(), maxBytes);
     content = buf.toString('base64');
     bytes = buf.length;
-    if (!fileName) fileName = path.basename(filePath);
+    if (!fileName) fileName = sanitizeFileName(path.basename(realPath));
   } else {
-    let raw = String(args.data_base64).trim();
-    const m = /^data:([^;,\s]+);base64,([\s\S]+)$/i.exec(raw);
+    let raw = args.data_base64.trim();
+    const m = /^data:([^;,\s]+)(?:;[^;,\s]+)*;base64,([\s\S]+)$/i.exec(raw);
     if (m) {
-      if (!mimeType) mimeType = m[1];
+      if (!mimeType) mimeType = m[1].trim();
       raw = m[2];
     }
     const cleaned = raw.replace(/\s+/g, '');
+    if (maxBytes && cleaned.length > Math.ceil(maxBytes / 3) * 4 + 4) {
+      throw rpcError(-32005, `asset exceeds ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+    }
     if (!cleaned || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned) || cleaned.length % 4 !== 0) {
       throw rpcError(-32602, 'data_base64 is not valid base64');
     }
@@ -788,6 +855,10 @@ function prepareMediaUpload(args = {}, maxBytes = MAX_ASSET_BYTES) {
     }
     content = cleaned;
     bytes = buf.length;
+  }
+
+  if (mimeType && !MIME_TYPE_RE.test(mimeType)) {
+    throw rpcError(-32602, 'mime_type must be a valid type/subtype (e.g. "image/png")');
   }
 
   return {
@@ -902,7 +973,7 @@ const TOOLS = [
   },
   {
     name: 'send_media',
-    description: 'Send an image, video, audio, or file attachment to a chat, with an optional text caption. Provide either `file_path` (a local file readable by the MCP server, avoiding HTTP body-size limits) or `data_base64` (base64-encoded bytes or data URI). Uploads the asset via Beeper\'s `/v1/assets/upload/base64` endpoint and sends it to the chat.',
+    description: 'Send an image, video, audio, or file attachment to a chat, with an optional text caption. Provide either `file_path` (confined to BEEPERBOX_UPLOAD_ROOT; disabled when unset) or `data_base64` (base64-encoded bytes or data URI; note HTTP transport defaults MCP_MAX_BODY to 1 MiB). Uploads via Beeper\'s `/v1/assets/upload/base64` endpoint and sends to the chat. Captionless sends rely on resolveSentId for `source: "api"` echo-guard tagging.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1115,7 +1186,16 @@ async function callTool(name, args) {
     }
 
     case 'send_media': {
-      if (!args.chat_id) throw rpcError(-32602, 'send_media requires chat_id');
+      if (typeof args.chat_id !== 'string' || !args.chat_id) throw rpcError(-32602, 'send_media requires chat_id');
+      if (args.type !== undefined && !ALLOWED_ATTACHMENT_TYPES.has(args.type)) {
+        throw rpcError(-32602, `send_media type must be one of: ${[...ALLOWED_ATTACHMENT_TYPES].join(', ')}`);
+      }
+      if (args.text !== undefined && typeof args.text !== 'string') {
+        throw rpcError(-32602, 'send_media text must be a string');
+      }
+      if (args.reply_to_message_id !== undefined && typeof args.reply_to_message_id !== 'string') {
+        throw rpcError(-32602, 'send_media reply_to_message_id must be a string');
+      }
       const media = prepareMediaUpload(args);
       const uploadBody = { content: media.content };
       if (media.fileName) uploadBody.fileName = media.fileName;
@@ -1127,7 +1207,8 @@ async function callTool(name, args) {
         timeoutMs: ASSET_TIMEOUT_MS,
       });
       if (!upload || !upload.uploadID) {
-        throw rpcError(-32001, 'beeper asset upload did not return an uploadID');
+        const detail = upload?.error ? `: ${String(upload.error).slice(0, 200)}` : '';
+        throw rpcError(-32001, `beeper asset upload did not return an uploadID${detail}`);
       }
 
       const attachment = { uploadID: upload.uploadID };
@@ -1505,6 +1586,7 @@ module.exports = {
   normalizeAccount,
   assertServableSrcUrl,
   prepareMediaUpload,
+  callTool,
   matchSentMessage,
   recordSent,
   addResolvedId,

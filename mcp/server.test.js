@@ -575,15 +575,18 @@ test('normalizeAccount surfaces the backend connection status (observability)', 
 });
 
 // ── send_media: prepareMediaUpload + captionless echo-guard ─────
-test('prepareMediaUpload: validates input presence and mutual exclusion', () => {
+test('prepareMediaUpload: validates input presence, mutual exclusion, and field formats', () => {
   assert.throws(() => S.prepareMediaUpload({}), /requires file_path or data_base64/);
   assert.throws(
     () => S.prepareMediaUpload({ file_path: '/tmp/a.png', data_base64: 'AQID' }),
     /not both/,
   );
+  assert.throws(() => S.prepareMediaUpload({ data_base64: 'AQID', mime_type: 'not-a-mime' }), /valid type\/subtype/);
+  const sanitized = S.prepareMediaUpload({ data_base64: 'AQID', file_name: '../../evil\x00name.png' }, 100);
+  assert.equal(sanitized.fileName, 'evilname.png');
 });
 
-test('prepareMediaUpload: decodes raw base64 and data URI, strips mime_type, enforces cap', () => {
+test('prepareMediaUpload: decodes raw base64 and RFC 2397 data URIs, strips mime_type, enforces cap', () => {
   const raw = S.prepareMediaUpload({ data_base64: 'AQID', file_name: 'dot.bin' }, 100);
   assert.equal(raw.content, 'AQID');
   assert.equal(raw.bytes, 3);
@@ -595,22 +598,118 @@ test('prepareMediaUpload: decodes raw base64 and data URI, strips mime_type, enf
   assert.equal(uri.bytes, 3);
   assert.equal(uri.mimeType, 'image/png');
 
+  const paramUri = S.prepareMediaUpload({ data_base64: 'data:text/plain;charset=utf-8;base64,SGVsbG8=' }, 100);
+  assert.equal(paramUri.content, 'SGVsbG8=');
+  assert.equal(paramUri.bytes, 5);
+  assert.equal(paramUri.mimeType, 'text/plain');
+
   assert.throws(() => S.prepareMediaUpload({ data_base64: 'not*base64!' }, 100), /not valid base64/);
+  assert.throws(() => S.prepareMediaUpload({ data_base64: '====' }, 100), /0 bytes/);
   assert.throws(() => S.prepareMediaUpload({ data_base64: 'AQID' }, 2), /over the 2-byte cap/);
+  assert.throws(() => S.prepareMediaUpload({ data_base64: 'A'.repeat(16) }, 2), /exceeds 2-byte cap/);
 });
 
-test('prepareMediaUpload: reads file_path, derives fileName, enforces cap', () => {
-  const file = path.join(os.tmpdir(), `bb-media-test-${process.pid}.png`);
-  fs.writeFileSync(file, Buffer.from([1, 2, 3, 4]));
+test('prepareMediaUpload: file_path is disabled without BEEPERBOX_UPLOAD_ROOT and confined when set', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bb-upload-root-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'bb-upload-outside-'));
+  const insideFile = path.join(root, 'map.png');
+  const emptyFile = path.join(root, 'empty.png');
+  const outsideFile = path.join(outside, 'secret.txt');
+  const symlinkEscape = path.join(root, 'escape.txt');
+  const origRoot = process.env.BEEPERBOX_UPLOAD_ROOT;
+
+  fs.writeFileSync(insideFile, Buffer.from([1, 2, 3, 4]));
+  fs.writeFileSync(emptyFile, Buffer.alloc(0));
+  fs.writeFileSync(outsideFile, Buffer.from('secret'));
+  fs.symlinkSync(outsideFile, symlinkEscape);
+
   try {
-    const res = S.prepareMediaUpload({ file_path: file }, 100);
+    delete process.env.BEEPERBOX_UPLOAD_ROOT;
+    assert.throws(() => S.prepareMediaUpload({ file_path: insideFile }, 100), /disabled unless BEEPERBOX_UPLOAD_ROOT/);
+
+    process.env.BEEPERBOX_UPLOAD_ROOT = root;
+    const res = S.prepareMediaUpload({ file_path: insideFile }, 100);
     assert.equal(res.content, 'AQIDBA==');
     assert.equal(res.bytes, 4);
-    assert.equal(res.fileName, path.basename(file));
-    assert.throws(() => S.prepareMediaUpload({ file_path: file }, 2), /over the 2-byte cap/);
-    assert.throws(() => S.prepareMediaUpload({ file_path: `${file}.missing` }, 100), /cannot read file_path/);
+    assert.equal(res.fileName, 'map.png');
+
+    assert.throws(() => S.prepareMediaUpload({ file_path: insideFile }, 2), /over the 2-byte cap/);
+    assert.throws(() => S.prepareMediaUpload({ file_path: emptyFile }, 100), /empty \(0 bytes\)/);
+    assert.throws(() => S.prepareMediaUpload({ file_path: root }, 100), /not a regular file/);
+    assert.throws(() => S.prepareMediaUpload({ file_path: outsideFile }, 100), /outside BEEPERBOX_UPLOAD_ROOT/);
+    assert.throws(() => S.prepareMediaUpload({ file_path: symlinkEscape }, 100), /outside BEEPERBOX_UPLOAD_ROOT/);
+    assert.throws(() => S.prepareMediaUpload({ file_path: path.join(root, 'missing.png') }, 100), /not readable or outside/);
   } finally {
+    if (origRoot === undefined) delete process.env.BEEPERBOX_UPLOAD_ROOT;
+    else process.env.BEEPERBOX_UPLOAD_ROOT = origRoot;
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* ignore */ }
+    try { fs.rmSync(outside, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+});
+
+test('callTool send_media: validates type, uploads base64, sends attachment, surfaces upload.error', async () => {
+  const file = path.join(os.tmpdir(), `bb-send-media-test-${process.pid}.json`);
+  process.env.BEEPERBOX_SENT_LEDGER = file;
+  const origRetries = process.env.BEEPERBOX_RESOLVE_RETRIES;
+  const calls = [];
+  global.fetch = async (url, init) => {
+    const body = init?.body ? JSON.parse(init.body) : null;
+    calls.push({ url, method: init?.method || 'GET', body });
+    if (String(url).endsWith('/v1/assets/upload/base64')) {
+      if (body.fileName === 'fail.png') {
+        return { ok: true, status: 200, text: async () => JSON.stringify({ error: 'unsupported format' }) };
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ uploadID: 'up_123', fileName: body.fileName || 'img.png', mimeType: 'image/png' }),
+      };
+    }
+    if (String(url).includes('/messages') && init?.method === 'POST') {
+      return { ok: true, status: 200, text: async () => JSON.stringify({ chatID: '!c1:b', pendingMessageID: 'pend_1' }) };
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ id: 'final_1' }) };
+  };
+
+  try {
+    S._resetLedger();
+    await assert.rejects(
+      () => S.callTool('send_media', { chat_id: '!c1:b', data_base64: 'AQID', type: 'invalid-type' }),
+      /must be one of/,
+    );
+    await assert.rejects(
+      () => S.callTool('send_media', { chat_id: '!c1:b', data_base64: 'AQID', file_name: 'fail.png' }),
+      /unsupported format/,
+    );
+
+    calls.length = 0;
+    const out = await S.callTool('send_media', {
+      chat_id: '!c1:b',
+      data_base64: 'data:image/png;base64,AQID',
+      file_name: 'map.png',
+      type: 'image',
+      text: 'Map caption',
+      reply_to_message_id: 'm_0',
+      client_tag: 'tag-m',
+    });
+    assert.equal(out.status, 'sent');
+    assert.equal(out.upload_id, 'up_123');
+    assert.equal(out.message_id, 'final_1');
+    assert.equal(out.resolved, true);
+    assert.equal(calls[0].body.content, 'AQID');
+    assert.equal(calls[0].body.mimeType, 'image/png');
+    assert.deepEqual(calls[1].body, {
+      attachment: { uploadID: 'up_123', type: 'image' },
+      text: 'Map caption',
+      replyToMessageID: 'm_0',
+    });
+  } finally {
+    global.fetch = REAL_FETCH;
+    if (origRetries === undefined) delete process.env.BEEPERBOX_RESOLVE_RETRIES;
+    else process.env.BEEPERBOX_RESOLVE_RETRIES = origRetries;
     try { fs.unlinkSync(file); } catch { /* ignore */ }
+    delete process.env.BEEPERBOX_SENT_LEDGER;
+    S._resetLedger();
   }
 });
 
