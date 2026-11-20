@@ -20,7 +20,7 @@ WhatsApp, iMessage, Signal, Telegram, Discord, Slack, Messenger, Instagram, Link
 
 ## Two ways to run
 
-Same MCP server, same 12 tools, same `serverInfo.version` — by construction, because both modes run the [same single file](mcp/server.js). Pick by where Beeper lives:
+Same MCP server, same 13 tools, same `serverInfo.version` — by construction, because both modes run the [same single file](mcp/server.js). Pick by where Beeper lives:
 
 | | **Container** | **Lite** (`npx`) |
 |---|---|---|
@@ -78,7 +78,7 @@ Done.
 |---|---|---|
 | `6080` | noVNC web UI — first-run login only | `127.0.0.1` |
 | `23373` | Raw Beeper Desktop HTTP API | `127.0.0.1` |
-| `23375` | Opinionated 12-tool MCP server | `127.0.0.1` |
+| `23375` | Opinionated 13-tool MCP server | `127.0.0.1` |
 
 All three are env-overridable (`BEEPERBOX_NOVNC_PORT`, `BEEPERBOX_HOST_PORT`, `BEEPERBOX_MCP_PORT`) so you can run multiple instances on one VPS. For remote access use SSH tunnel, Tailscale, or a TLS reverse proxy — never drop the `127.0.0.1` prefix.
 
@@ -125,7 +125,7 @@ BEEPER_TOKEN=your-token-here npx beeperbox --stdio
 
 ## The MCP
 
-Not a thin proxy over Beeper's raw API — an **opinionated 12-tool verb layer** built for an LLM to drive. Every tool returns one normalized `Chat` / `Message` schema (so the agent never learns a second shape), propagates `chat_id` + `network` onto every message (no second lookup to know where a hit came from), and is documented in-schema for the model. Reach across all 50+ networks; the agent never knows which bridge it's talking to.
+Not a thin proxy over Beeper's raw API — an **opinionated 13-tool verb layer** built for an LLM to drive. Every tool returns one normalized `Chat` / `Message` schema (so the agent never learns a second shape), propagates `chat_id` + `network` onto every message (no second lookup to know where a hit came from), and is documented in-schema for the model. Reach across all 50+ networks; the agent never knows which bridge it's talking to.
 
 **Read / triage**
 
@@ -143,6 +143,7 @@ Not a thin proxy over Beeper's raw API — an **opinionated 12-tool verb layer**
 | Tool | What it does |
 |---|---|
 | `send_message` | The headline write — reply or initiate; markdown, `reply_to_message_id`, returns the new message ID |
+| `send_media` | Upload and send an image, video, audio, or file attachment (`file_path` or `data_base64`), with optional caption and `client_tag` |
 | `note_to_self` | The agent's private command/control channel — recorded, excluded from every inbox view |
 | `react_to_message` | Lightest "I saw it" — a unicode emoji, visible to the sender on every network |
 | `archive_chat` | The "done with this conversation" primitive (Beeper exposes no mark-as-read) |

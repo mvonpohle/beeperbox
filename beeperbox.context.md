@@ -10,7 +10,7 @@
 beeperbox is a headless [Beeper Desktop](https://www.beeper.com/) in a Docker container that exposes **two things to agents**:
 
 1. **Raw Beeper Desktop HTTP API** on `127.0.0.1:23373` — the unmodified `/v1/*` endpoints for callers who want full control.
-2. **Opinionated Model Context Protocol server** on `127.0.0.1:23375` (HTTP) or stdio — 12 semantic tools, normalized `Chat` / `Message` schemas, note-to-self isolation, clean network slugs. Consume from Claude Code, Cursor, Cline, Continue, bareagent, or any other MCP-speaking runtime.
+2. **Opinionated Model Context Protocol server** on `127.0.0.1:23375` (HTTP) or stdio — 13 semantic tools, normalized `Chat` / `Message` schemas, note-to-self isolation, clean network slugs. Consume from Claude Code, Cursor, Cline, Continue, bareagent, or any other MCP-speaking runtime.
 
 Agents that consume beeperbox get read/write access to **every bridge the user's Beeper account has connected**: WhatsApp, iMessage, Signal, Discord, Slack, Telegram, Facebook Messenger, Instagram, LinkedIn, Google Messages, Matrix, and any future Beeper bridge. One config, every messenger.
 
@@ -38,6 +38,7 @@ docker run -d \
 | Read recent messages in one chat | `read_chat` |
 | Fetch one chat's metadata (unread count, title, etc.) | `get_chat` |
 | Send a reply or notification to a chat | `send_message` |
+| Send an image, video, audio, or file attachment | `send_media` |
 | Ack a message without sending a reply | `react_to_message` |
 | Search all chats for a keyword | `search_messages` |
 | Record a self-note that doesn't pollute the inbox | `note_to_self` |
@@ -202,6 +203,17 @@ Send a text message to a chat. Markdown supported.
 **Returns:** `{chat_id, message_id, pending_message_id, resolved, client_tag, status: "sent"}`.
 **Note:** `message_id` is the **final bridge id** when beeperbox could resolve it (`resolved: true`), else the `pendingMessageID` (`resolved: false`). `pending_message_id` is always the raw pending id. Use `message_id` for downstream `react_to_message`. The resolution is what lets the echo-guard match read-backs by **exact id**, not text (see the Message schema caveat).
 **`client_tag` (echo-guard):** optional idempotency/echo key. beeperbox records it against this send and echoes it back on the message — marked `source: "api"` — when it reappears in `poll_messages` / `read_chat`. Lets an agent recognize and skip its own programmatic sends without a brittle text-prefix hack (see `poll_messages` and the Message schema).
+
+### `send_media`
+
+Upload and send an image, video, audio, or file attachment to a chat, with an optional text caption. Internally uploads via `POST /v1/assets/upload/base64` and sends via `POST /v1/chats/{chatID}/messages`.
+
+**Arguments:** `{chat_id: string, file_path?: string, data_base64?: string, file_name?: string, mime_type?: string, type?: "image"|"video"|"audio"|"file"|"gif"|"voice-note"|"sticker", text?: string, reply_to_message_id?: string, client_tag?: string}` (provide either `file_path` or `data_base64` — raw base64 or `data:...;base64,...` URI — not both).
+**Returns:** `{chat_id, message_id, pending_message_id, resolved, upload_id, file_name, mime_type, bytes, client_tag, status: "sent"}`.
+**Limits & Security:**
+- Asset bytes are capped at `BEEPERBOX_MAX_ASSET_BYTES` (default 8 MiB). Note that over the HTTP transport `MCP_MAX_BODY` defaults to 1 MiB (~750 KB binary after base64 overhead); raise `MCP_MAX_BODY` or use `file_path` / `--stdio` for larger payloads.
+- `file_path` is disabled unless `BEEPERBOX_UPLOAD_ROOT` is set, and is confined to that directory via `fs.realpathSync`.
+- Captionless sends record `text_hash: null` and rely on `resolveSentId` (`message_id` resolution) for `source: "api"` echo-guard tagging.
 
 ### `note_to_self`
 
@@ -389,8 +401,8 @@ Beeper's token creation UI has an **"Allow sensitive actions"** toggle that gate
 
 | Token scope | Allowed tools | Denied tools |
 |---|---|---|
-| **Read + write** (Allow sensitive actions: **on**) | all 11 | none |
-| **Read only** (Allow sensitive actions: **off**) | `list_accounts`, `list_inbox`, `list_unread`, `poll_messages`, `get_chat`, `read_chat`, `search_messages` | `send_message`, `note_to_self`, `react_to_message`, `archive_chat` (all return `-32001` / `401 Unauthorized`) |
+| **Read + write** (Allow sensitive actions: **on**) | all 13 | none |
+| **Read only** (Allow sensitive actions: **off**) | `list_accounts`, `list_inbox`, `list_unread`, `poll_messages`, `get_chat`, `read_chat`, `search_messages`, `download_asset` | `send_message`, `send_media`, `note_to_self`, `react_to_message`, `archive_chat` (all return `-32001` / `401 Unauthorized`) |
 
 Use this for least-privilege agents: give a monitoring or summarization agent a read-only token so a prompt-injection attack cannot make it send messages.
 
@@ -569,7 +581,7 @@ beeperbox v0.4.x is a POC → early product. Real-world usage notes:
 | `0.2.0` | `4.2.715` | `2025-03-26` | `linux/amd64` |
 | `0.1.0` | `4.2.715` | — | `linux/amd64` |
 
-Published tags: `:latest` (newest release, rebuilt weekly and **test-gated** — a build that fails the MCP/VNC guard checks or the first-paint check (amd64 and arm64) is not published), `:previous` (the prior `:latest`, kept as a known-good fallback — `BEEPERBOX_IMAGE_TAG=previous` to roll back), `:next` (master with the newest stable Beeper, published only after the same gates pass — a preview ahead of the Beeper pinned in `:latest`; `:next-beeper-<ver>` names a specific build), `:X.Y.Z` (a release; note it is re-pushed by the weekly cron while it's the newest, so it is *not* immutable). For a bit-exact, frozen image, pin the **digest** (`ghcr.io/hamr0/beeperbox@sha256:…`).
+Published tags: `:latest` (newest release, rebuilt weekly and **test-gated** — a build that fails the MCP/VNC guard checks or the first-paint check (amd64 and arm64) is not published), `:previous` (the prior `:latest`, kept as a known-good fallback — `BEEPERBOX_IMAGE_TAG=previous` to roll back), `:next` (master with the newest stable Beeper, published only after the same gates pass — a preview ahead of the Beeper that `:latest` pins; `:next-beeper-<ver>` names a specific build), `:X.Y.Z` (a release; note it is re-pushed by the weekly cron while it's the newest, so it is *not* immutable). For a bit-exact, frozen image, pin the **digest** (`ghcr.io/hamr0/beeperbox@sha256:…`).
 
 Beeper Desktop is frozen at build time in the image. Released images use the Beeper version pinned in `beeper-version.txt`; `:next` tracks the newest stable. A manual `docker compose build --no-cache` without `--build-arg BEEPER_VERSION` still pulls whatever Beeper Desktop is current at that moment. API schema changes in newer Beeper versions may break normalizers — open an issue if you hit one. For a reproducible, hash-verified build, pass `--build-arg BEEPER_VERSION=<ver> --build-arg BEEPER_SHA256=<sha256>`; without them a manual build pulls the latest stable Beeper (the Dockerfile default; released images pass the pin explicitly).
 
