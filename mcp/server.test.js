@@ -604,7 +604,7 @@ test('prepareMediaUpload: decodes raw base64 and RFC 2397 data URIs, strips mime
   assert.equal(paramUri.mimeType, 'text/plain');
 
   assert.throws(() => S.prepareMediaUpload({ data_base64: 'not*base64!' }, 100), /not valid base64/);
-  assert.throws(() => S.prepareMediaUpload({ data_base64: '====' }, 100), /0 bytes/);
+  assert.throws(() => S.prepareMediaUpload({ data_base64: '====' }, 100), /not valid base64/);
   assert.throws(() => S.prepareMediaUpload({ data_base64: 'AQID' }, 2), /over the 2-byte cap/);
   assert.throws(() => S.prepareMediaUpload({ data_base64: 'A'.repeat(16) }, 2), /exceeds 2-byte cap/);
 });
