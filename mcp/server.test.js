@@ -576,10 +576,14 @@ test('normalizeAccount surfaces the backend connection status (observability)', 
 
 // ── send_media: prepareMediaUpload + captionless echo-guard ─────
 test('prepareMediaUpload: validates input presence, mutual exclusion, and field formats', () => {
-  assert.throws(() => S.prepareMediaUpload({}), /requires file_path or data_base64/);
+  assert.throws(() => S.prepareMediaUpload({}), /requires file_path, data_base64, or url/);
   assert.throws(
     () => S.prepareMediaUpload({ file_path: '/tmp/a.png', data_base64: 'AQID' }),
-    /not both/,
+    /accepts only one/,
+  );
+  assert.throws(
+    () => S.prepareMediaUpload({ data_base64: 'AQID', url: 'https://example.com/a.png' }),
+    /accepts only one/,
   );
   assert.throws(() => S.prepareMediaUpload({ data_base64: 'AQID', mime_type: 'not-a-mime' }), /valid type\/subtype/);
   const sanitized = S.prepareMediaUpload({ data_base64: 'AQID', file_name: '../../evil\x00name.png' }, 100);
@@ -730,6 +734,102 @@ test('captionless send does not false-match unrelated captionless human messages
     const ours = S.matchSentMessage({ id: 'pending-media-1', chat_id: 'c1', text: '', is_self: true }, entries, Date.now());
     assert.deepEqual(ours, { source: 'api', client_tag: 'media-1' });
   } finally {
+    try { fs.unlinkSync(file); } catch { /* ignore */ }
+    delete process.env.BEEPERBOX_SENT_LEDGER;
+    S._resetLedger();
+  }
+});
+
+test('assertSafeUploadUrl: blocks non-https, credentials, private/loopback/metadata IPs, and respects allowlist', async () => {
+  const pubDns = async () => [{ address: '93.184.216.34', family: 4 }];
+  const privDns = async () => [{ address: '127.0.0.1', family: 4 }];
+  const metaDns = async () => [{ address: '169.254.169.254', family: 4 }];
+  const v6PrivDns = async () => [{ address: 'fd00::1', family: 6 }];
+
+  await assert.rejects(() => S.assertSafeUploadUrl('http://example.com/a.png', pubDns), /must use https/);
+  await assert.rejects(() => S.assertSafeUploadUrl('file:///etc/passwd', pubDns), /must use https/);
+  await assert.rejects(() => S.assertSafeUploadUrl('https://user:pass@example.com/a.png', pubDns), /credentials/);
+  await assert.rejects(() => S.assertSafeUploadUrl('https://127.0.0.1/a.png', pubDns), /disallowed or private/);
+  await assert.rejects(() => S.assertSafeUploadUrl('https://10.0.0.5/a.png', pubDns), /disallowed or private/);
+  await assert.rejects(() => S.assertSafeUploadUrl('https://192.168.1.1/a.png', pubDns), /disallowed or private/);
+  await assert.rejects(() => S.assertSafeUploadUrl('https://[::1]/a.png', pubDns), /disallowed or private/);
+  await assert.rejects(() => S.assertSafeUploadUrl('https://rebind.example/a.png', privDns), /disallowed or private/);
+  await assert.rejects(() => S.assertSafeUploadUrl('https://rebind.example/a.png', metaDns), /disallowed or private/);
+  await assert.rejects(() => S.assertSafeUploadUrl('https://rebind.example/a.png', v6PrivDns), /disallowed or private/);
+
+  const ok = await S.assertSafeUploadUrl('https://demo.openbot.site/map.png', pubDns);
+  assert.equal(ok.hostname, 'demo.openbot.site');
+
+  const origAllow = process.env.BEEPERBOX_UPLOAD_ALLOWED_HOSTS;
+  try {
+    process.env.BEEPERBOX_UPLOAD_ALLOWED_HOSTS = '*.openbot.site';
+    await S.assertSafeUploadUrl('https://demo.openbot.site/map.png', pubDns);
+    await assert.rejects(() => S.assertSafeUploadUrl('https://evil.com/map.png', pubDns), /BEEPERBOX_UPLOAD_ALLOWED_HOSTS/);
+  } finally {
+    if (origAllow === undefined) delete process.env.BEEPERBOX_UPLOAD_ALLOWED_HOSTS;
+    else process.env.BEEPERBOX_UPLOAD_ALLOWED_HOSTS = origAllow;
+  }
+});
+
+test('fetchMediaUrl + callTool send_media via url: enforces redirects, byte cap, and uploads bytes', async () => {
+  const pubDns = async () => [{ address: '93.184.216.34', family: 4 }];
+  const file = path.join(os.tmpdir(), `bb-send-media-url-test-${process.pid}.json`);
+  process.env.BEEPERBOX_SENT_LEDGER = file;
+  const calls = [];
+  global.fetch = async (url, init) => {
+    const s = String(url);
+    if (s === 'https://93.184.216.34/redirect') {
+      return { ok: false, status: 302, headers: new Headers(), arrayBuffer: async () => new ArrayBuffer(0) };
+    }
+    if (s === 'https://93.184.216.34/big.png') {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': 'image/png', 'content-length': '999' }),
+        arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer,
+      };
+    }
+    if (s === 'https://93.184.216.34/map.jpg') {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': 'image/jpeg; charset=binary' }),
+        arrayBuffer: async () => new Uint8Array([10, 20, 30]).buffer,
+      };
+    }
+    const body = init?.body ? JSON.parse(init.body) : null;
+    calls.push({ url: s, method: init?.method || 'GET', body });
+    if (s.endsWith('/v1/assets/upload/base64')) {
+      return { ok: true, status: 200, text: async () => JSON.stringify({ uploadID: 'up_url_1', fileName: body.fileName, mimeType: body.mimeType }) };
+    }
+    if (s.includes('/messages') && init?.method === 'POST') {
+      return { ok: true, status: 200, text: async () => JSON.stringify({ chatID: '!c1:b', pendingMessageID: 'pend_u1' }) };
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ id: 'final_u1' }) };
+  };
+
+  try {
+    S._resetLedger();
+    await assert.rejects(() => S.fetchMediaUrl('https://93.184.216.34/redirect', 100, { lookupFn: pubDns }), /redirects/);
+    await assert.rejects(() => S.fetchMediaUrl('https://93.184.216.34/big.png', 100, { lookupFn: pubDns }), /over the 100-byte cap/);
+
+    const fetched = await S.fetchMediaUrl('https://93.184.216.34/map.jpg', 100, { lookupFn: pubDns });
+    assert.equal(fetched.mimeType, 'image/jpeg');
+    assert.equal(fetched.fileName, 'map.jpg');
+    assert.equal(fetched.buf.length, 3);
+
+    const out = await S.callTool('send_media', {
+      chat_id: '!c1:b',
+      url: 'https://93.184.216.34/map.jpg',
+      text: 'Via URL',
+    });
+    assert.equal(out.status, 'sent');
+    assert.equal(out.upload_id, 'up_url_1');
+    assert.equal(calls[0].body.content, Buffer.from([10, 20, 30]).toString('base64'));
+    assert.equal(calls[0].body.fileName, 'map.jpg');
+    assert.equal(calls[0].body.mimeType, 'image/jpeg');
+  } finally {
+    global.fetch = REAL_FETCH;
     try { fs.unlinkSync(file); } catch { /* ignore */ }
     delete process.env.BEEPERBOX_SENT_LEDGER;
     S._resetLedger();
