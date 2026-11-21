@@ -9,6 +9,8 @@ const http = require('http');
 const crypto = require('crypto');
 const path = require('path');
 const os = require('os');
+const net = require('net');
+const dns = require('dns');
 
 // Single source of truth for the version: the sibling package.json — so the
 // lite-mode npm package, the container (which COPYs this dir to /opt/mcp), and
@@ -630,7 +632,7 @@ function recordSent({ chat_id, sent_id, text, client_tag }) {
     // when we have the authoritative final id (retires the text fallback).
     sent_ids: sent_id ? [String(sent_id)] : [],
     resolved: false,
-    text_hash: textHash(text),
+    text_hash: String(text || '').trim() ? textHash(text) : null,
     client_tag: client_tag ? String(client_tag).slice(0, CLIENT_TAG_MAX) : null,
     ts: Date.now(),
   };
@@ -704,7 +706,7 @@ function matchSentMessage(msg, entries, now) {
     for (const e of entries) {
       if (e.chat_id !== msg.chat_id) continue;
       if (e.resolved === true) continue;
-      if (e.text_hash === h && (now - e.ts) <= LEDGER_TEXT_WINDOW_MS) {
+      if (e.text_hash != null && e.text_hash === h && (now - e.ts) <= LEDGER_TEXT_WINDOW_MS) {
         return { source: 'api', client_tag: e.client_tag || null };
       }
     }
@@ -723,6 +725,288 @@ function applyEchoTags(messages, now) {
     );
     return { ...m, source: meta.source, client_tag: meta.client_tag };
   });
+}
+
+// ─── media upload helper ──────────────────────────────────────────
+
+const ALLOWED_ATTACHMENT_TYPES = new Set([
+  'image', 'video', 'audio', 'file', 'gif', 'voice-note', 'sticker',
+]);
+const MIME_TYPE_RE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i;
+
+function sanitizeFileName(name) {
+  if (name == null) return '';
+  if (typeof name !== 'string') throw rpcError(-32602, 'file_name must be a string');
+  const base = path.basename(name).replace(/[\x00-\x1f\x7f/\\]/g, '').trim().slice(0, 255);
+  return (base === '.' || base === '..') ? '' : base;
+}
+
+function readBoundedFile(filePath, maxBytes) {
+  const fs = require('fs');
+  const uploadRoot = process.env.BEEPERBOX_UPLOAD_ROOT || '';
+  if (!uploadRoot) {
+    throw rpcError(-32602, 'file_path is disabled unless BEEPERBOX_UPLOAD_ROOT is set');
+  }
+  let realRoot;
+  let realPath;
+  let stat;
+  try {
+    realRoot = fs.realpathSync(uploadRoot);
+    realPath = fs.realpathSync(filePath);
+    const rootPrefix = realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep;
+    if (realPath !== realRoot && !realPath.startsWith(rootPrefix)) {
+      throw new Error('outside root');
+    }
+    stat = fs.statSync(realPath);
+  } catch {
+    throw rpcError(-32602, 'file_path is not readable or outside BEEPERBOX_UPLOAD_ROOT');
+  }
+  if (!stat.isFile()) {
+    throw rpcError(-32602, 'file_path is not a regular file');
+  }
+  if (maxBytes && stat.size > maxBytes) {
+    throw rpcError(-32005, `asset is ${stat.size} bytes, over the ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+  }
+
+  const limit = maxBytes ? maxBytes + 1 : 0;
+  let fd;
+  const chunks = [];
+  let total = 0;
+  try {
+    fd = fs.openSync(realPath, 'r');
+    const chunkSize = 65536;
+    while (true) {
+      const toRead = limit ? Math.min(chunkSize, limit - total) : chunkSize;
+      if (toRead <= 0) break;
+      const chunk = Buffer.allocUnsafe(toRead);
+      const n = fs.readSync(fd, chunk, 0, toRead, null);
+      if (n === 0) break;
+      chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
+      total += n;
+    }
+  } catch {
+    throw rpcError(-32602, 'file_path is not readable or outside BEEPERBOX_UPLOAD_ROOT');
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
+    }
+  }
+
+  if (total === 0) {
+    throw rpcError(-32602, 'file_path is empty (0 bytes)');
+  }
+  if (maxBytes && total > maxBytes) {
+    throw rpcError(-32005, `asset exceeds ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+  }
+  return { buf: Buffer.concat(chunks, total), realPath };
+}
+
+// Normalize either a confined `file_path` or a `data_base64` string (optionally
+// wrapped in a `data:<mime>;base64,...` URI) into the JSON payload expected by
+// Beeper's `POST /v1/assets/upload/base64`. Enforces MAX_ASSET_BYTES before
+// allocating large buffers so oversized payloads fail fast with -32005.
+function isDisallowedIp(ip) {
+  const s = String(ip || '').toLowerCase();
+  if (net.isIPv4(s)) {
+    const [a, b] = s.split('.').map(Number);
+    if (a === 0 || a === 10 || a === 127 || a >= 224) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    return false;
+  }
+  if (net.isIPv6(s)) {
+    const clean = s.split('%')[0];
+    if (clean === '::' || clean === '::1') return true;
+    if (clean.startsWith('::ffff:')) {
+      const v4 = clean.slice(7);
+      if (net.isIPv4(v4)) return isDisallowedIp(v4);
+      const hex = v4.split(':');
+      if (hex.length === 2) {
+        const hi = parseInt(hex[0], 16);
+        const lo = parseInt(hex[1], 16);
+        if (Number.isFinite(hi) && Number.isFinite(lo)) {
+          return isDisallowedIp(`${(hi >> 8) & 255}.${hi & 255}.${(lo >> 8) & 255}.${lo & 255}`);
+        }
+      }
+    }
+    const first = clean.split(':')[0];
+    if (first.startsWith('fc') || first.startsWith('fd') || first.startsWith('ff')) return true;
+    if (/^fe[89ab]/i.test(first)) return true;
+    return false;
+  }
+  return true;
+}
+
+function hostMatchesAllowlist(host, allowRaw) {
+  if (!allowRaw) return true;
+  const h = host.toLowerCase();
+  const entries = allowRaw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (entries.length === 0) return true;
+  return entries.some((p) => {
+    if (p.startsWith('*.')) return h.endsWith(p.slice(1)) && h.length > p.length - 1;
+    if (p.startsWith('.')) return h.endsWith(p);
+    return h === p;
+  });
+}
+
+async function assertSafeUploadUrl(rawUrl, lookupFn = (h, o) => dns.promises.lookup(h, o)) {
+  let u;
+  try { u = new URL(rawUrl); } catch {
+    throw rpcError(-32602, 'url is not a valid URL');
+  }
+  if (u.protocol !== 'https:') {
+    throw rpcError(-32602, 'url must use https://');
+  }
+  if (u.username || u.password) {
+    throw rpcError(-32602, 'url must not include credentials');
+  }
+  const host = u.hostname.replace(/^\[|\]$/g, '');
+  if (!host) throw rpcError(-32602, 'url must include a host');
+  if (!hostMatchesAllowlist(host, process.env.BEEPERBOX_UPLOAD_ALLOWED_HOSTS || '')) {
+    throw rpcError(-32602, 'url host is not in BEEPERBOX_UPLOAD_ALLOWED_HOSTS');
+  }
+  if (net.isIP(host)) {
+    if (isDisallowedIp(host)) throw rpcError(-32602, 'url resolves to a disallowed or private IP address');
+    return u;
+  }
+  let addrs;
+  try { addrs = await lookupFn(host, { all: true }); } catch {
+    throw rpcError(-32602, 'url host could not be resolved');
+  }
+  if (!Array.isArray(addrs) || addrs.length === 0 || addrs.some((a) => isDisallowedIp(a.address))) {
+    throw rpcError(-32602, 'url resolves to a disallowed or private IP address');
+  }
+  return u;
+}
+
+async function fetchMediaUrl(rawUrl, maxBytes = MAX_ASSET_BYTES, opts = {}) {
+  const u = await assertSafeUploadUrl(rawUrl, opts.lookupFn);
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), opts.timeoutMs || ASSET_TIMEOUT_MS);
+  try {
+    const r = await fetch(u.toString(), { method: 'GET', redirect: 'manual', signal: ac.signal });
+    if (r.status >= 300 && r.status < 400) {
+      throw rpcError(-32602, 'url redirects are not allowed');
+    }
+    if (!r.ok) {
+      throw rpcError(-32001, `url fetch failed with HTTP ${r.status}`);
+    }
+    const declared = parseInt(r.headers?.get?.('content-length') || '', 10);
+    if (maxBytes && Number.isFinite(declared) && declared > maxBytes) {
+      throw rpcError(-32005, `asset is ${declared} bytes, over the ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+    }
+    let buf;
+    if (r.body && typeof r.body.getReader === 'function') {
+      const reader = r.body.getReader();
+      const chunks = [];
+      let total = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (maxBytes && total > maxBytes) {
+          try { await reader.cancel(); } catch { /* ignore */ }
+          throw rpcError(-32005, `asset exceeds ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+        }
+        chunks.push(Buffer.from(value));
+      }
+      buf = Buffer.concat(chunks, total);
+    } else {
+      buf = Buffer.from(await r.arrayBuffer());
+      if (maxBytes && buf.length > maxBytes) {
+        throw rpcError(-32005, `asset is ${buf.length} bytes, over the ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+      }
+    }
+    if (buf.length === 0) {
+      throw rpcError(-32602, 'url returned 0 bytes');
+    }
+    const rawCt = (r.headers?.get?.('content-type') || '').split(';')[0].trim();
+    const urlName = sanitizeFileName(path.posix.basename(u.pathname || ''));
+    return { buf, mimeType: rawCt, fileName: urlName };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function validateMediaSourceArgs(args = {}) {
+  if (args.file_path !== undefined && typeof args.file_path !== 'string') {
+    throw rpcError(-32602, 'file_path must be a string');
+  }
+  if (args.data_base64 !== undefined && typeof args.data_base64 !== 'string') {
+    throw rpcError(-32602, 'data_base64 must be a string');
+  }
+  if (args.url !== undefined && typeof args.url !== 'string') {
+    throw rpcError(-32602, 'url must be a string');
+  }
+  if (args.mime_type !== undefined && typeof args.mime_type !== 'string') {
+    throw rpcError(-32602, 'mime_type must be a string');
+  }
+  const hasPath = typeof args.file_path === 'string' && args.file_path.trim().length > 0;
+  const hasB64 = typeof args.data_base64 === 'string' && args.data_base64.trim().length > 0;
+  const hasUrl = typeof args.url === 'string' && args.url.trim().length > 0;
+  const count = (hasPath ? 1 : 0) + (hasB64 ? 1 : 0) + (hasUrl ? 1 : 0);
+  if (count === 0) {
+    throw rpcError(-32602, 'send_media requires file_path, data_base64, or url');
+  }
+  if (count > 1) {
+    throw rpcError(-32602, 'send_media accepts only one of file_path, data_base64, or url');
+  }
+  return { hasPath, hasB64, hasUrl };
+}
+
+function prepareMediaUpload(args = {}, maxBytes = MAX_ASSET_BYTES) {
+  const { hasPath, hasUrl } = validateMediaSourceArgs(args);
+  if (hasUrl) {
+    throw rpcError(-32602, 'url requires async fetchMediaUrl');
+  }
+
+  let content = '';
+  let bytes = 0;
+  let fileName = sanitizeFileName(args.file_name);
+  let mimeType = args.mime_type ? args.mime_type.trim() : '';
+
+  if (hasPath) {
+    const { buf, realPath } = readBoundedFile(args.file_path.trim(), maxBytes);
+    content = buf.toString('base64');
+    bytes = buf.length;
+    if (!fileName) fileName = sanitizeFileName(path.basename(realPath));
+  } else {
+    let raw = args.data_base64.trim();
+    const m = /^data:([^;,\s]+)(?:;[^;,\s]+)*;base64,([\s\S]+)$/i.exec(raw);
+    if (m) {
+      if (!mimeType) mimeType = m[1].trim();
+      raw = m[2];
+    }
+    const cleaned = raw.replace(/\s+/g, '');
+    if (maxBytes && cleaned.length > Math.ceil(maxBytes / 3) * 4 + 4) {
+      throw rpcError(-32005, `asset exceeds ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+    }
+    if (!cleaned || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned) || cleaned.length % 4 !== 0) {
+      throw rpcError(-32602, 'data_base64 is not valid base64');
+    }
+    const buf = Buffer.from(cleaned, 'base64');
+    if (buf.length === 0) {
+      throw rpcError(-32602, 'data_base64 decoded to 0 bytes');
+    }
+    if (maxBytes && buf.length > maxBytes) {
+      throw rpcError(-32005, `asset is ${buf.length} bytes, over the ${maxBytes}-byte cap — raise BEEPERBOX_MAX_ASSET_BYTES`);
+    }
+    content = cleaned;
+    bytes = buf.length;
+  }
+
+  if (mimeType && !MIME_TYPE_RE.test(mimeType)) {
+    throw rpcError(-32602, 'mime_type must be a valid type/subtype (e.g. "image/png")');
+  }
+
+  return {
+    content,
+    bytes,
+    fileName: fileName || null,
+    mimeType: mimeType || null,
+  };
 }
 
 // ─── tool registry ────────────────────────────────────────────────
@@ -824,6 +1108,27 @@ const TOOLS = [
         client_tag: { type: 'string', description: 'Optional idempotency/echo tag. Recorded against this send and echoed back on the message as `client_tag` when it reappears in poll_messages / read_chat (where it is also marked source:"api"), so an agent can recognize and skip its own programmatic sends.' },
       },
       required: ['chat_id', 'text'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'send_media',
+    description: 'Send an image, video, audio, or file attachment to a chat, with an optional text caption. Provide one of `file_path` (confined to BEEPERBOX_UPLOAD_ROOT; disabled when unset), `data_base64` (base64-encoded bytes or data URI; note HTTP transport defaults MCP_MAX_BODY to 1 MiB), or `url` (HTTPS URL fetched by the server with SSRF checks). Uploads via Beeper\'s `/v1/assets/upload/base64` endpoint and sends to the chat. Captionless sends rely on resolveSentId for `source: "api"` echo-guard tagging.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        chat_id: { type: 'string', description: 'The chat ID to send to (the `id` field from any Chat object).' },
+        file_path: { type: 'string', description: 'Path to a local file readable by the MCP server. Provide one of file_path, data_base64, or url.' },
+        data_base64: { type: 'string', description: 'Base64-encoded file bytes (raw base64 or data:...;base64,... URI). Provide one of file_path, data_base64, or url.', minLength: 1 },
+        url: { type: 'string', description: 'HTTPS URL of the media file to fetch and upload. Provide one of file_path, data_base64, or url.', minLength: 1 },
+        file_name: { type: 'string', description: 'Optional original file name. Derived from file_path if omitted.' },
+        mime_type: { type: 'string', description: 'Optional MIME type (e.g. "image/png"). Auto-detected by Beeper if omitted.' },
+        type: { type: 'string', enum: ['image', 'video', 'audio', 'file', 'gif', 'voice-note', 'sticker'], description: 'Optional attachment type hint. Auto-detected from MIME type if omitted.' },
+        text: { type: 'string', description: 'Optional caption or message text to send with the attachment.' },
+        reply_to_message_id: { type: 'string', description: 'Optional. Pass a message_id to send this as a reply to that specific message.' },
+        client_tag: { type: 'string', description: 'Optional idempotency/echo tag. Recorded against this send and echoed back on the message as `client_tag` when it reappears in poll_messages / read_chat (where it is also marked source:"api").' },
+      },
+      required: ['chat_id'],
       additionalProperties: false,
     },
   },
@@ -1016,6 +1321,78 @@ async function callTool(name, args) {
         message_id: finalID || pendingID,
         pending_message_id: pendingID,
         resolved: !!finalID,
+        client_tag: args.client_tag || null,
+        status: 'sent',
+      };
+    }
+
+    case 'send_media': {
+      if (typeof args.chat_id !== 'string' || !args.chat_id) throw rpcError(-32602, 'send_media requires chat_id');
+      if (args.type !== undefined && !ALLOWED_ATTACHMENT_TYPES.has(args.type)) {
+        throw rpcError(-32602, `send_media type must be one of: ${[...ALLOWED_ATTACHMENT_TYPES].join(', ')}`);
+      }
+      if (args.text !== undefined && typeof args.text !== 'string') {
+        throw rpcError(-32602, 'send_media text must be a string');
+      }
+      if (args.reply_to_message_id !== undefined && typeof args.reply_to_message_id !== 'string') {
+        throw rpcError(-32602, 'send_media reply_to_message_id must be a string');
+      }
+      const { hasUrl } = validateMediaSourceArgs(args);
+      let media;
+      if (hasUrl) {
+        const fetched = await fetchMediaUrl(args.url.trim());
+        const fileName = sanitizeFileName(args.file_name) || fetched.fileName;
+        const mimeType = (args.mime_type ? args.mime_type.trim() : '') || fetched.mimeType;
+        if (mimeType && !MIME_TYPE_RE.test(mimeType)) {
+          throw rpcError(-32602, 'mime_type must be a valid type/subtype (e.g. "image/png")');
+        }
+        media = {
+          content: fetched.buf.toString('base64'),
+          bytes: fetched.buf.length,
+          fileName: fileName || null,
+          mimeType: mimeType || null,
+        };
+      } else {
+        media = prepareMediaUpload(args);
+      }
+      const uploadBody = { content: media.content };
+      if (media.fileName) uploadBody.fileName = media.fileName;
+      if (media.mimeType) uploadBody.mimeType = media.mimeType;
+
+      const upload = await beeperFetch('/v1/assets/upload/base64', {
+        method: 'POST',
+        body: uploadBody,
+        timeoutMs: ASSET_TIMEOUT_MS,
+      });
+      if (!upload || !upload.uploadID) {
+        const detail = upload?.error ? `: ${String(upload.error).slice(0, 200)}` : '';
+        throw rpcError(-32001, `beeper asset upload did not return an uploadID${detail}`);
+      }
+
+      const attachment = { uploadID: upload.uploadID };
+      if (args.type) attachment.type = args.type;
+      const body = { attachment };
+      if (args.text) body.text = args.text;
+      if (args.reply_to_message_id) body.replyToMessageID = args.reply_to_message_id;
+
+      const sent = await beeperFetch(
+        `/v1/chats/${encodeURIComponent(args.chat_id)}/messages`,
+        { method: 'POST', body },
+      );
+      const chatID = sent?.chatID || args.chat_id;
+      const pendingID = String(sent?.pendingMessageID || '');
+      const entry = recordSent({ chat_id: chatID, sent_id: pendingID, text: args.text || '', client_tag: args.client_tag });
+      const finalID = await resolveSentId(chatID, pendingID);
+      if (finalID) addResolvedId(entry, finalID);
+      return {
+        chat_id: chatID,
+        message_id: finalID || pendingID,
+        pending_message_id: pendingID,
+        resolved: !!finalID,
+        upload_id: upload.uploadID,
+        file_name: upload.fileName || media.fileName || null,
+        mime_type: upload.mimeType || media.mimeType || null,
+        bytes: media.bytes,
         client_tag: args.client_tag || null,
         status: 'sent',
       };
@@ -1366,6 +1743,11 @@ module.exports = {
   normalizeAttachments,
   normalizeAccount,
   assertServableSrcUrl,
+  prepareMediaUpload,
+  isDisallowedIp,
+  assertSafeUploadUrl,
+  fetchMediaUrl,
+  callTool,
   matchSentMessage,
   recordSent,
   addResolvedId,
